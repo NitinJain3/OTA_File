@@ -1,0 +1,394 @@
+//xcept performupdate() function, everything is working 25 july 2025
+
+
+#include <ESP8266WiFi.h>
+#include <PubSubClient.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <WiFiClientSecureBearSSL.h>
+#include <time.h>
+#include <Updater.h>
+
+
+// Wi-Fi Credentials
+const char* ssid1 = "Jam";
+const char* password1 = "12345678*!";
+const char* ssid2 = "Airtel_Nitin-2.4G";
+const char* password2 = "Welgud397$";
+
+// MQTT Broker Details
+const char* mqtt_server = "c08b3d81e0f94d47a8ac60943a294290.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "hivemq.webclient.1753427488132";
+//const char* mqtt_user              = "hivemq.webclient.1742289651293";
+const char* mqtt_password = "za.0GeIW9dBkV?5#*6Af";
+//const char* mqtt_password          = "v$N#4w<YZAa7*jiQ1zS9";
+const char* ota_command_topic = "ota/command";
+const char* ota_status_topic = "ota/status";
+const char* device_info_topic = "device/info";
+const char* connection_status_topic = "device/connection_status";  // New topic for connection status
+//const char* checkmqtt_Status_topic = "device/mqtt_status";         // New topic for connection status
+
+//#define LED_BUILTIN 02
+#define PIN D5
+
+// Secure MQTT Client
+//BearSSL::WiFiClientSecure espClient;
+
+
+// MQTT Client
+WiFiClientSecure espClient;  // Secure WiFi client (SSL/TLS)
+//WiFiClient espClient;   // Use unsecured connection for port 1883
+PubSubClient client(espClient);
+
+
+// Device Information
+#define DEVICE_ID "ESP8266_Device_002"
+#define FIRMWARE_VERSION "1.1.1"
+#define OTA_BUFFER_SIZE 256
+
+uint8_t otaBuffer[OTA_BUFFER_SIZE];
+
+// Function prototypes
+bool connectToWiFi(const char* ssid, const char* password);
+void connectToMQTT();
+void sendDeviceInfo();
+// void sendConnectionStatus();
+void led_blink();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void performOTAUpdate(const char* firmware_url);
+//TimeInfo syncTime();  // just a prototype
+
+// ---Timers---
+unsigned long previousMillisWifiStatus = 0;  // Stores last WiFi status check time
+unsigned long previousMillisLED = 0;         // Stores last LED blink time
+unsigned long previousMillisMQTT = 0;        // Stores last MQTT loop time
+unsigned long previousMillisMQTTStatus = 0;  // Stores last time MQTT status was checked
+
+// Intervals for tasks
+const long intervalWifiStatus = 60000;  // Interval for WiFi connection status (10 seconds)
+const long intervalLED = 1000;          // Interval for LED blink (1 second)
+const long intervalMQTT = 10000;        // Interval for MQTT loop (10 seconds)
+const long intervalMQTTStatus = 30000;  // Interval to check MQTT subscription status (5 seconds)
+
+//---counter---
+unsigned long counter = 0;
+
+struct TimeInfo {
+  String gmtStr;
+  String istStr;
+};
+
+void setup() {
+  delay(500);  // Short delay to let boot messages finish
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\r\nDevice initializing...");
+  Serial.println("Device Firmware_version:" + String(FIRMWARE_VERSION));
+  pinMode(LED_BUILTIN, OUTPUT);
+  pinMode(PIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);  // Start with LED OFF (inverted logic)
+  // Try connecting to the first Wi-Fi network
+  if (!connectToWiFi(ssid1, password1) && !connectToWiFi(ssid2, password2)) {
+    Serial.println("Failed to connect to any Wi-Fi network.");
+  }
+  syncTime();  // Sync time before using TLS  // only once here
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+  connectToMQTT();
+}
+
+
+int sequence_no() {
+  return ++counter;
+}
+
+// Call once in setup to sync with NTP
+void syncTime() {
+  // Serial.println("Waiting for NTP time sync...");
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");  // Get time from NTP servers
+  time_t now = time(nullptr);
+  while (now < 1577836800) {  // Keep trying until a valid timestamp is received // Wait until we get a timestamp beyond Jan 1, 2020
+    // Serial.print(".");
+    delay(500);
+    now = time(nullptr);
+  }
+  Serial.println("Time synchronized!");
+}
+
+// Call anytime to get current GMT & IST strings
+TimeInfo getTimeInfo() {
+  TimeInfo timeInfo;
+  time_t now = time(nullptr);
+  // --- GMT Time ---
+  struct tm gmtTime;
+  gmtime_r(&now, &gmtTime);
+  char gmtBuf[30];
+  strftime(gmtBuf, sizeof(gmtBuf), "%Y-%m-%d %H:%M:%S", &gmtTime);
+  timeInfo.gmtStr = String(gmtBuf);
+
+  // --- Local Time (IST +5:30) --
+  // IST = UTC + 19800s   // Apply manual time zone offset (IST = +5:30 = +19800 seconds)
+  time_t localNow = now + 19800;  // Add 5 hours 30 minutes = 19800 seconds
+  struct tm localTime;
+  localtime_r(&localNow, &localTime);  // local time calculation // Thread-safe version of localtime()
+  char istBuf[30];
+  strftime(istBuf, sizeof(istBuf), "%Y-%m-%d %H:%M:%S", &localTime);
+  timeInfo.istStr = String(istBuf);
+  // now += 19800; // Add 5 hours 30 minutes = 19800 seconds
+  // struct tm timeinfo;
+  // // gmtime_r(&now, &timeinfo);
+  // localtime_r(&now, &timeinfo);
+  // Serial.print("Current Time(Local Time): ");
+  // Serial.println(asctime(&timeinfo));
+  // // Serial.println(ctime(&timeinfo));
+  // // Serial.println(localtime(&timeinfo));
+  return timeInfo;
+}
+
+
+bool connectToWiFi(const char* ssid, const char* password) {
+  // Serial.print("Connecting to Wi-Fi: ");
+  // Serial.println(ssid);
+
+  WiFi.begin(ssid, password);  // Start Wi-Fi connection
+
+  // Wait for connection (10-second timeout)
+  unsigned long startAttemptTime = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000) {
+    delay(1000);
+    Serial.print(".");
+  }
+  // Check connection status
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to Wi-Fi");
+    // Serial.println("\nConnected to Wi-Fi :" + String(ssid));
+    // Serial.println("IP Address: " + WiFi.localIP().toString());
+    // Serial.println("DNS Server: " + WiFi.dnsIP().toString());
+    Serial.println("Wi-Fi Signal Strength: " + String(WiFi.RSSI()) + " dBm");
+    return true;  // Connection successful
+  }
+
+  Serial.println("\nWi-Fi Connection failed.");
+  return false;  // Connection failed
+}
+
+void connectToMQTT() {
+  espClient.setInsecure();  // Ignore SSL verification (use only for testing!)
+  while (!client.connected()) {
+    Serial.println("Connecting to MQTT...");
+    if (client.connect(DEVICE_ID, mqtt_user, mqtt_password)) {
+      Serial.println("Connected to MQTT");
+      client.subscribe(ota_command_topic);
+      Serial.println("-----Device initializing Completed-----");
+      sendDeviceInfo();
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" trying again in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message received on topic: ");
+  Serial.println(topic);
+  String message;
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  if (String(topic) == ota_command_topic) {
+    Serial.println("Payload length: " + String(message.length()) + "bytes");  //MQTT Payload Size in bytes:
+    performOTAUpdate(message.c_str());
+  }
+}
+
+
+void performOTAUpdate(const char* firmware_url) {
+  Serial.println("Starting OTA update...");
+  HTTPClient http;
+  http.begin(espClient, firmware_url);  // Fixed API call
+
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_SEE_OTHER) {  // Handle HTTP 303 Redirect
+    String redirectURL = http.header("Location");
+    Serial.println("Redirected to: " + redirectURL);
+    if (redirectURL.length() == 0) {
+      Serial.println("Error: Redirect URL is empty.");
+      client.publish("ota/status", "OTA update failed: empty redirect URL");
+      http.end();
+      return;
+    }
+    http.end();
+    http.begin(espClient, redirectURL);  // Fixed API call for redirect
+    httpCode = http.GET();
+  }
+
+  if (httpCode == HTTP_CODE_OK) {
+    Serial.println("File request successful.");
+    int contentLength = http.getSize();
+    Serial.print("Content-Length: ");
+    Serial.println(contentLength);
+    Serial.print("Free Heap Before Update: ");
+    Serial.println(ESP.getFreeHeap());
+
+    if (!Update.begin(contentLength)) {
+      Serial.println("Not enough space for OTA update.");
+      Serial.print("Available Flash Size: ");
+      Serial.println(ESP.getFreeSketchSpace());
+      client.publish("ota/status", "OTA update failed: insufficient space");
+      return;
+    }
+
+
+    if (Update.begin(contentLength)) {
+      Serial.println("Update started...");
+      Serial.print("Free Heap After Update Start: ");
+      Serial.println(ESP.getFreeHeap());
+      WiFiClient* updateClient = http.getStreamPtr();  // Use WiFiClient or WiFiClientSecure
+      size_t written = 0;
+      unsigned long lastTime = millis();
+
+      while (written < contentLength) {
+        int bytesRead = updateClient->read(otaBuffer, OTA_BUFFER_SIZE);
+        if (bytesRead > 0) {
+          Update.write(otaBuffer, bytesRead);
+          written += bytesRead;
+          //size_t currentWrite = Update.writeStream(*updateClient);
+          //written += currentWrite;
+          // Prevent WDT reset
+          yield();  // Gives control back to the system to prevent watchdog timeout
+        }
+
+        unsigned long currentTime = millis();
+        if (currentTime - lastTime > 2000) {
+          int downloadProgress = (written * 100) / contentLength;
+          Serial.print("Download Progress: ");
+          Serial.print(downloadProgress);
+          Serial.println("%");
+          lastTime = currentTime;
+          client.loop();
+        }
+      }
+
+      if (Update.end() && Update.isFinished()) {
+        // if (client.connected()) {
+        //   client.publish("ota/status", "OTA update successful", true);
+        // } else {
+        //   Serial.println("MQTT Disconnected. Reconnecting...");
+        //   if (client.connect("ESP8266_Client")) {
+        //     Serial.println("Reconnected to MQTT. Publishing message...");
+        //     client.publish("ota/status", "OTA update successful", true);
+        //   }
+        // }
+
+        Serial.println("OTA update completed. Restarting...");
+        client.publish("ota/status", "OTA update successful", true);  // Retained message
+        delay(500);                                                   // Small delay to allow processing
+        client.loop();                                                // Ensure the message is sent
+
+        // Wait until the message is completely sent
+        unsigned long startTime = millis();
+        while (!client.loop() && millis() - startTime < 3000) {
+          delay(100);  // Keep MQTT client alive for 2 seconds
+        }
+
+        Serial.println("Restarting now...");
+        delay(3000);  // Extra delay before restart
+        ESP.restart();
+      } else {
+        Serial.println("OTA update failed: Incomplete update.");
+        client.publish("ota/status", "OTA update failed: incomplete update");
+      }
+    } else {
+      Serial.println("OTA update failed: Size mismatch.");
+      client.publish("ota/status", "OTA update failed: size mismatch");
+    }
+  } else {
+    Serial.println("Not enough space for OTA update.");
+    client.publish("ota/status", "OTA update failed: insufficient space");
+  }
+
+  Serial.println("Firmware download failed. HTTP code: " + String(httpCode));
+  String errorMessage = "OTA update failed: HTTP " + String(httpCode);
+  client.publish("ota/status", errorMessage.c_str());  // Convert String to const char*
+
+  http.end();
+}
+
+
+void sendDeviceInfo() {
+  String payload_length;
+  int seq = sequence_no();        // Increment and store the sequence number
+  TimeInfo time = getTimeInfo();  // Get both GMT and IST time strings
+  // String payload = "Seq_no:" + String(seq) + ", Device_id:" + String(DEVICE_ID) + ", Firmware_version:" + String(FIRMWARE_VERSION);
+  // String payload = "{\"Seq_no\":" + String(seq) + ",\"Device_id\":\"" + String(DEVICE_ID) + "\",\"Firmware_version\":\"" + String(FIRMWARE_VERSION) + "\",\"Time_UTC\":\"" + time.gmtStr + " UTC\",\"Time_IST\":\"" + time.istStr + " IST\"}";
+  String payload = "{";
+  payload += "\"Seq_no\":" + String(seq);
+  payload += ",\"Device_id\":\"" + String(DEVICE_ID) + "\"";
+  payload += ",\"Firmware_version\":\"" + String(FIRMWARE_VERSION) + "\"";
+  payload += ",\"Time_UTC\":\"" + time.gmtStr + " UTC\"";
+  payload += ",\"Time_IST\":\"" + time.istStr + " IST\"";
+  payload += "}";
+  if (client.publish(device_info_topic, payload.c_str())) {
+    Serial.println("Device info sent: " + payload);
+  } else {
+    Serial.println("Failed to send device info.");
+  }
+  //Serial.println("Payload length: " + String(payload.length()) + "bytest"); //MQTT Payload Size in bytes:
+}
+
+// void sendConnectionStatus() {
+//   String connectionStatus = WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED";
+//   String payload = "Device: " + String(DEVICE_ID) + ",Status: " + connectionStatus;
+//   if (client.publish(connection_status_topic, payload.c_str())) {
+//     Serial.println("Connection status sent: " + payload);
+//   } else {
+//     Serial.println("Failed to send connection status.");
+//   }
+// }
+
+void led_blink() {
+  // Blink the built-in LED
+  digitalWrite(LED_BUILTIN, LOW);  // Turn the LED on (Inverted Logic)
+  digitalWrite(PIN, HIGH);
+  //digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));  // Toggle LED state
+  //digitalWrite(PIN, !digitalRead(PIN));
+  // Read and print the LED status
+  // int ledStatus = digitalRead(LED_BUILTIN);
+  // Serial.print("LED Status: ");
+  // Serial.println(ledStatus ? "OFF" : "ON");
+}
+
+void loop() {
+  unsigned long currentMillis = millis();  // Get current time since program start
+  //Serial.print("Free Heap: ");
+  //Serial.println(ESP.getFreeHeap());
+  // Ensure MQTT connection is maintained
+  if (!client.connected()) {
+    connectToMQTT();
+  }
+  // Blink LED every 1 second
+  if (currentMillis - previousMillisLED >= intervalLED) {
+    previousMillisLED = currentMillis;  // Update the last time LED blinked
+    // Serial.print("Millis: ");
+    // Serial.println(currentMillis);
+    led_blink();  // Blink the LED
+  }
+  // Send WiFi connection status every 10 seconds
+  // if (currentMillis - previousMillisWifiStatus >= intervalWifiStatus) {
+  //   previousMillisWifiStatus = currentMillis;  // Update the last time WiFi status was sent
+  //   sendConnectionStatus();                    // Send connection status
+  // }
+
+  // Run the MQTT client loop every 5 seconds
+  if (currentMillis - previousMillisMQTT >= intervalMQTT) {
+    previousMillisMQTT = currentMillis;  // Update the last time MQTT loop was run
+    sendDeviceInfo();
+    //client.loop();  // Process incoming MQTT messages
+  }
+  client.loop();
+}
